@@ -1,0 +1,150 @@
+# Este arquivo é um exemplo de configuração do Docker Compose para o Apache Airflow.
+version: '3.8' # Especificar uma versão é recomendado
+
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+    args: # Passar UID para dentro do build, se necessário no Dockerfile
+      AIRFLOW_UID: ${AIRFLOW_UID:-50000}
+  environment:
+    # Note que AIRFLOW__CORE__FERNET_KEY virá do .env agora
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__FERNET_KEY: "c6ojOPtRwVnDqLAUOJiGVrbez4ojMdnIg4-c3YGLBTk="
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    # Usar variáveis do .env para conexão com o DB
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@postgres/${POSTGRES_DB:-airflow}
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true" # Já presente, manter
+    _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
+  volumes:
+    - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
+    # Removido volume redundante para dags/sql, já incluído no volume dags
+    - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
+    - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
+    - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
+    - ${AIRFLOW_PROJ_DIR:-.}/requirements.txt:/opt/airflow/requirements.txt # Certifique-se que este arquivo existe ou remova se não usar
+    - ${AIRFLOW_PROJ_DIR:-.}/sample_files:/opt/airflow/sample_files # Remova se não usar
+    - ./spark_jobs:/opt/bitnami/spark_jobs # Remova se não usar Spark
+  user: ${AIRFLOW_UID:-50000}:0
+  depends_on:
+    postgres:
+      condition: service_healthy
+  networks:
+    - airflow_network # Renomeado para clareza, mas 'confluent' também funciona
+
+services:
+  postgres:
+    image: postgres:15.3-alpine
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    logging:
+      options:
+        max-size: 10m
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER:-airflow}"] # Usar variável aqui também
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+    networks:
+      - airflow_network
+    volumes: # Adicionar volume para persistir dados do postgres
+      - postgres_data:/var/lib/postgresql/data
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow_init # Nomear o container pode ajudar na depuração
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: /bin/bash # Usar entrypoint para clareza
+    command:
+      - -c
+      - |
+        echo "Verificando variáveis..."
+        echo "AIRFLOW_UID=$(id -u)" # Verificar o UID dentro do container
+        echo "Verificando permissões em /opt/airflow/logs..."
+        ls -ld /opt/airflow/logs || echo "Logs dir não existe ou sem permissão"
+        touch /opt/airflow/logs/test_write.log && rm /opt/airflow/logs/test_write.log || echo "Não foi possível escrever em /opt/airflow/logs"
+        echo "Iniciando inicialização do banco de dados e usuário..."
+        airflow db init && \
+        airflow users create \
+          --username admin \
+          --firstname admin \
+          --lastname admin \
+          --role Admin \
+          --email admin@example.com \
+          --password admin
+    user: ${AIRFLOW_UID:-50000}:0 # Garantir que o init também use o UID correto
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow_webserver
+    command: airflow webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      # Remover dependência direta do postgres, já está no *airflow-common
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow_scheduler
+    command: airflow scheduler
+    healthcheck:
+      # Corrigido o healthcheck do scheduler
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$${HOSTNAME}\""]
+      interval: 30s
+      timeout: 10s # Aumentar timeout se o check demorar
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      # Remover dependência direta do postgres
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-triggerer:
+    <<: *airflow-common
+    container_name: airflow_triggerer
+    command: airflow triggerer
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type TriggererJob --hostname \"$${HOSTNAME}\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      # Remover dependência direta do postgres
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-cli:
+    <<: *airflow-common
+    container_name: airflow_cli
+    profiles:
+      - debug # Não inicia por padrão
+    # Remover depends_on, já está no *airflow-common
+    entrypoint: /bin/bash # Mudar para bash para uso interativo
+    command: [-c, airflow] # Comando padrão, pode ser sobrescrito com 'docker-compose run airflow-cli bash'
+
+networks:
+  airflow_network: # Nome da rede alterado
+    driver: bridge
+
+volumes: # Definir o volume do postgres explicitamente
+  postgres_data:
